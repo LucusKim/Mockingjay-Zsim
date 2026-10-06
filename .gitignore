@@ -1,0 +1,9 @@
+# zsim build and simulation outputs
+build/
+outputs/
+*.o
+*.h5
+heartbeat
+out.cfg
+zsim.out
+pin.log

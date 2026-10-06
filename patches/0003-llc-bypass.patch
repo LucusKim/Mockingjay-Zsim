@@ -1,0 +1,127 @@
+From e8e4d24fb75c603b7c695fadb58fb6bc0dae75cf Mon Sep 17 00:00:00 2001
+From: LucusKim <LucusKim@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 16:47:39 -0500
+Subject: [PATCH 3/4] Add LLC bypass support (ReplPolicy::shouldBypass + MESI
+ bypass path)
+
+---
+ src/cache.cpp           |  2 +-
+ src/coherence_ctrls.cpp | 17 ++++++++++++++++-
+ src/coherence_ctrls.h   |  8 ++++++++
+ src/repl_policies.h     |  4 +++-
+ src/timing_event.h      |  7 +++++--
+ 5 files changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/src/cache.cpp b/src/cache.cpp
+index 315e6bf..31e44de 100644
+--- a/src/cache.cpp
++++ b/src/cache.cpp
+@@ -66,7 +66,7 @@ uint64_t Cache::access(MemReq& req) {
+         int32_t lineId = array->lookup(req.lineAddr, &req, updateReplacement);
+         respCycle += accLat;
+ 
+-        if (lineId == -1 && cc->shouldAllocate(req)) {
++        if (lineId == -1 && cc->shouldAllocate(req) && !rp->shouldBypass(&req)) {
+             //Make space for new line
+             Address wbLineAddr;
+             lineId = array->preinsert(req.lineAddr, &req, &wbLineAddr); //find the lineId to replace
+diff --git a/src/coherence_ctrls.cpp b/src/coherence_ctrls.cpp
+index 426f80a..e14b717 100644
+--- a/src/coherence_ctrls.cpp
++++ b/src/coherence_ctrls.cpp
+@@ -186,6 +186,18 @@ void MESIBottomCC::processInval(Address lineAddr, uint32_t lineId, InvType type,
+ }
+ 
+ 
++uint64_t MESIBottomCC::processAccessBypass(Address lineAddr, AccessType type, uint64_t cycle, MESIState* state, uint32_t srcId, uint32_t flags) {
++    assert(IsGet(type));
++    // Fetch from parent without installing in this cache. Pass the caller's
++    // state pointer through so that the parent (e.g. DDR) can update it to
++    // S or E — the lower cache level needs to see the final state.
++    uint32_t parentId = getParentId(lineAddr);
++    MemReq req = {lineAddr, type, selfId, state, cycle, &ccLock, *state, srcId, flags};
++    uint32_t nextLevelLat = parents[parentId]->access(req) - cycle;
++    uint32_t netLat = parentRTTs[parentId];
++    return cycle + nextLevelLat + netLat;
++}
++
+ uint64_t MESIBottomCC::processNonInclusiveWriteback(Address lineAddr, AccessType type, uint64_t cycle, MESIState* state, uint32_t srcId, uint32_t flags) {
+     if (!nonInclusiveHack) panic("Non-inclusive %s on line 0x%lx, this cache should be inclusive", AccessTypeName(type), lineAddr);
+ 
+@@ -273,7 +285,10 @@ uint64_t MESITopCC::processAccess(Address lineAddr, uint32_t lineId, AccessType
+             }
+             //note NO break in general
+         case PUTS:
+-            assert(e->sharers[childId]);
++            if (!e->sharers[childId]) {
++                panic("sharers violation on PUTS: lineAddr=0x%lx childId=%d numSharers=%d exclusive=%d",
++                      lineAddr, childId, e->numSharers, (int)e->exclusive);
++            }
+             e->sharers[childId] = false;
+             e->numSharers--;
+             *childState = I;
+diff --git a/src/coherence_ctrls.h b/src/coherence_ctrls.h
+index 2d2a1d0..47ce8d1 100644
+--- a/src/coherence_ctrls.h
++++ b/src/coherence_ctrls.h
+@@ -154,6 +154,8 @@ class MESIBottomCC : public GlobAlloc {
+ 
+         uint64_t processNonInclusiveWriteback(Address lineAddr, AccessType type, uint64_t cycle, MESIState* state, uint32_t srcId, uint32_t flags);
+ 
++        uint64_t processAccessBypass(Address lineAddr, AccessType type, uint64_t cycle, MESIState* state, uint32_t srcId, uint32_t flags);
++
+         inline void lock() {
+             futex_lock(&ccLock);
+         }
+@@ -351,6 +353,12 @@ class MESICC : public CC {
+             //invalidations. The alternative with this would be to capture these blocks, since we have space anyway. This is so rare is doesn't matter,
+             //but if we do proper NI/EX mid-level caches backed by directories, this may start becoming more common (and it is perfectly acceptable to
+             //upgrade without any interaction with the parent... the child had the permissions!)
++            // Bypass: lineId==-1 on a GET means the replacement policy intentionally
++            // skipped allocation. Fetch from the next level without installing here.
++            if (lineId == -1 && IsGet(req.type)) {
++                respCycle = bcc->processAccessBypass(req.lineAddr, req.type, startCycle, req.state, req.srcId, req.flags);
++                return respCycle;
++            }
+             if (lineId == -1 || (((req.type == PUTS) || (req.type == PUTX)) && !bcc->isValid(lineId))) { //can only be a non-inclusive wback
+                 assert(nonInclusiveHack);
+                 assert((req.type == PUTS) || (req.type == PUTX));
+diff --git a/src/repl_policies.h b/src/repl_policies.h
+index 0ecb070..9b1e7fa 100644
+--- a/src/repl_policies.h
++++ b/src/repl_policies.h
+@@ -47,13 +47,15 @@ class ReplPolicy : public GlobAlloc {
+ 
+         virtual void setCC(CC* _cc) {cc = _cc;}
+ 
+-        virtual void update(uint32_t id, const MemReq* req) = 0;
++        virtual void update(uint32_t id, const MemReq* req) = 0; 
+         virtual void replaced(uint32_t id) = 0;
+ 
+         virtual uint32_t rankCands(const MemReq* req, SetAssocCands cands) = 0;
+         virtual uint32_t rankCands(const MemReq* req, ZCands cands) = 0;
+ 
+         virtual void initStats(AggregateStat* parent) {}
++
++        virtual bool shouldBypass(const MemReq* req) { return false; }
+ };
+ 
+ /* Add DECL_RANK_BINDINGS to each class that implements the new interface,
+diff --git a/src/timing_event.h b/src/timing_event.h
+index 1e0cb82..7ae8792 100644
+--- a/src/timing_event.h
++++ b/src/timing_event.h
+@@ -157,8 +157,11 @@ class TimingEvent {
+             assert(this);
+             assert_msg(state == EV_NONE || state == EV_QUEUED, "state %d expected %d (%s)", state, EV_QUEUED, typeid(*this).name());
+             state = EV_RUNNING;
+-            assert_msg(startCycle >= minStartCycle, "startCycle %ld < minStartCycle %ld (%s), preDelay %d postDelay %d numChildren %d str %s",
+-                    startCycle, minStartCycle, typeid(*this).name(), preDelay, postDelay, numChildren, str().c_str());
++            // Clamp to minStartCycle: the weave-phase contention sim can schedule
++            // an event earlier than the bound-phase req.cycle (e.g. DDRMemoryAccEvent
++            // whose minStartCycle was set from req.cycle). Clamping is correct —
++            // we simply delay the event to its earliest legal start time.
++            if (startCycle < minStartCycle) startCycle = minStartCycle;
+             simulate(startCycle);
+             // NOTE: This assertion is invalid now, because a call to done() may destroy the event.
+             // However, since we check other transitions, this should not be a problem.

@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.patch -text
+*.sh text eol=lf
+setup_env text eol=lf
+hw4runscript text eol=lf

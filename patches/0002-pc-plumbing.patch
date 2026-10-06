@@ -1,0 +1,148 @@
+From d89088444953751097be7c726f96f914d998c0a6 Mon Sep 17 00:00:00 2001
+From: LucusKim <LucusKim@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 16:47:39 -0500
+Subject: [PATCH 2/4] Expose instruction PC (BBL address) to replacement
+ policies via MemReq::pc
+
+---
+ src/filter_cache.h     | 8 +++++++-
+ src/memory_hierarchy.h | 4 ++++
+ src/ooo_core.cpp       | 7 +++++++
+ src/ooo_core.h         | 1 +
+ src/simple_core.cpp    | 1 +
+ src/timing_core.cpp    | 1 +
+ 6 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/filter_cache.h b/src/filter_cache.h
+index 9d1fb5e..8aeed29 100644
+--- a/src/filter_cache.h
++++ b/src/filter_cache.h
+@@ -60,6 +60,7 @@ class FilterCache : public Cache {
+ 
+         lock_t filterLock;
+         uint64_t fGETSHit, fGETXHit;
++        Address curPc;
+ 
+     public:
+         FilterCache(uint32_t _numSets, uint32_t _numLines, CC* _cc, CacheArray* _array,
+@@ -74,6 +75,7 @@ class FilterCache : public Cache {
+             fGETSHit = fGETXHit = 0;
+             srcId = -1;
+             reqFlags = 0;
++            curPc = 0;
+         }
+ 
+         void setSourceId(uint32_t id) {
+@@ -84,6 +86,10 @@ class FilterCache : public Cache {
+             reqFlags = flags;
+         }
+ 
++        void setPc(Address pc) {
++            curPc = pc;
++        }
++
+         void initStats(AggregateStat* parentStat) {
+             AggregateStat* cacheStat = new AggregateStat();
+             cacheStat->init(name.c_str(), "Filter cache stats");
+@@ -129,7 +135,7 @@ class FilterCache : public Cache {
+             Address pLineAddr = procMask | vLineAddr;
+             MESIState dummyState = MESIState::I;
+             futex_lock(&filterLock);
+-            MemReq req = {pLineAddr, isLoad? GETS : GETX, 0, &dummyState, curCycle, &filterLock, dummyState, srcId, reqFlags};
++            MemReq req = {pLineAddr, isLoad? GETS : GETX, 0, &dummyState, curCycle, &filterLock, dummyState, srcId, reqFlags, curPc};
+             uint64_t respCycle  = access(req);
+ 
+             //Due to the way we do the locking, at this point the old address might be invalidated, but we have the new address guaranteed until we release the lock
+diff --git a/src/memory_hierarchy.h b/src/memory_hierarchy.h
+index a399bf6..e87ff6a 100644
+--- a/src/memory_hierarchy.h
++++ b/src/memory_hierarchy.h
+@@ -100,6 +100,10 @@ struct MemReq {
+     };
+     uint32_t flags;
+ 
++    // PC of the instruction that triggered this access.
++    // Set by FilterCache from the core's current BBL address; 0 for internal cache ops.
++    uint64_t pc;
++
+     inline void set(Flag f) {flags |= f;}
+     inline bool is (Flag f) const {return flags & f;}
+ };
+diff --git a/src/ooo_core.cpp b/src/ooo_core.cpp
+index 0e208a3..eb02855 100644
+--- a/src/ooo_core.cpp
++++ b/src/ooo_core.cpp
+@@ -64,6 +64,7 @@ OOOCore::OOOCore(FilterCache* _l1i, FilterCache* _l1d, g_string& _name) : Core(_
+         regScoreboard[i] = 0;
+     }
+     prevBbl = nullptr;
++    prevBblAddr = 0;
+ 
+     lastStoreCommitCycle = 0;
+     lastStoreAddrCommitCycle = 0;
+@@ -165,6 +166,7 @@ inline void OOOCore::bbl(Address bblAddr, BblInfo* bblInfo) {
+     if (!prevBbl) {
+         // This is the 1st BBL since scheduled, nothing to simulate
+         prevBbl = bblInfo;
++        prevBblAddr = bblAddr;
+         // Kill lingering ops from previous BBL
+         loads = stores = 0;
+         return;
+@@ -172,9 +174,13 @@ inline void OOOCore::bbl(Address bblAddr, BblInfo* bblInfo) {
+ 
+     /* Simulate execution of previous BBL */
+ 
++    // Set PC on L1D so replacement policy can see which BBL's loads/stores these are
++    l1d->setPc(prevBblAddr);
++
+     uint32_t bblInstrs = prevBbl->instrs;
+     DynBbl* bbl = &(prevBbl->oooBbl[0]);
+     prevBbl = bblInfo;
++    prevBblAddr = bblAddr;
+ 
+     uint32_t loadIdx = 0;
+     uint32_t storeIdx = 0;
+@@ -426,6 +432,7 @@ inline void OOOCore::bbl(Address bblAddr, BblInfo* bblInfo) {
+     branchPc = 0;  // clear for next BBL
+ 
+     // Simulate current bbl ifetch
++    l1i->setPc(bblAddr);
+     Address endAddr = bblAddr + bblInfo->bytes;
+     for (Address fetchAddr = bblAddr; fetchAddr < endAddr; fetchAddr += lineSize) {
+         // The Nehalem frontend fetches instructions in 16-byte-wide accesses.
+diff --git a/src/ooo_core.h b/src/ooo_core.h
+index 24a5550..487389f 100644
+--- a/src/ooo_core.h
++++ b/src/ooo_core.h
+@@ -379,6 +379,7 @@ class OOOCore : public Core {
+         uint64_t regScoreboard[MAX_REGISTERS]; //contains timestamp of next issue cycles where each reg can be sourced
+ 
+         BblInfo* prevBbl;
++        Address prevBblAddr; // address of the BBL currently being simulated (set one BBL behind)
+ 
+         //Record load and store addresses
+         Address loadAddrs[256];
+diff --git a/src/simple_core.cpp b/src/simple_core.cpp
+index 5102faa..976815d 100644
+--- a/src/simple_core.cpp
++++ b/src/simple_core.cpp
+@@ -56,6 +56,7 @@ void SimpleCore::store(Address addr) {
+ }
+ 
+ void SimpleCore::bbl(Address bblAddr, BblInfo* bblInfo) {
++    l1d->setPc(bblAddr);
+     //info("BBL %s %p", name.c_str(), bblInfo);
+     //info("%d %d", bblInfo->instrs, bblInfo->bytes);
+     instrs += bblInfo->instrs;
+diff --git a/src/timing_core.cpp b/src/timing_core.cpp
+index 77b236b..3f59cd1 100644
+--- a/src/timing_core.cpp
++++ b/src/timing_core.cpp
+@@ -90,6 +90,7 @@ void TimingCore::storeAndRecord(Address addr) {
+ }
+ 
+ void TimingCore::bblAndRecord(Address bblAddr, BblInfo* bblInfo) {
++    l1d->setPc(bblAddr);
+     instrs += bblInfo->instrs;
+     curCycle += bblInfo->instrs;
+ 

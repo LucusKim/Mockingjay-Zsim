@@ -1,0 +1,287 @@
+From 45200d9824f2b09cbe96b6ce7bbfdfbca0eb692c Mon Sep 17 00:00:00 2001
+From: LucusKim <LucusKim@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 16:47:38 -0500
+Subject: [PATCH 1/4] casim-csce614 course baseline (SRRIP hook, A3 branch
+ predictor, per-run outputDir/heartbeat, build flags)
+
+---
+ SConstruct           |  3 ++-
+ src/SConscript       |  2 +-
+ src/init.cpp         | 12 +++++++++
+ src/ooo_core.cpp     |  6 ++++-
+ src/ooo_core.h       | 17 +++++++++++--
+ src/rrip_repl.h      | 59 ++++++++++++++++++++++++++++++++++++++++++++
+ src/zsim_harness.cpp |  7 +++++-
+ 7 files changed, 100 insertions(+), 6 deletions(-)
+ create mode 100644 src/rrip_repl.h
+
+diff --git a/SConstruct b/SConstruct
+index 1aec4ff..261554c 100644
+--- a/SConstruct
++++ b/SConstruct
+@@ -47,6 +47,7 @@ def buildSim(cppFlags, dir, type, pgo=None):
+     # NOTE: Original Pin flags included -fno-strict-aliasing, but zsim does not do type punning
+     # NOTE (dsm 16 Apr 2015): Update flags code to support Pin 2.14 while retaining backwards compatibility
+     env["CPPFLAGS"] += " -g -std=c++0x -Wall -Wno-unknown-pragmas -Wno-deprecated -Wno-unused-function -Wno-catch-value -fomit-frame-pointer -fno-stack-protector"
++#     env["CPPFLAGS"] += " -g -std=c++0x -Wall -Wno-unknown-pragmas -Wno-unused-function -fomit-frame-pointer -fno-stack-protector"
+     env["CPPFLAGS"] += " -MMD -DBIGARRAY_MULTIPLIER=1 -DUSING_XED -DTARGET_IA32E -DHOST_IA32E -fPIC -DTARGET_LINUX"
+     # NOTE (yyf 17 Sep 2020): Enforce to use older ABI when compiled with gcc-5 or newer.
+     env["CPPFLAGS"] += " -fabi-version=2 -D_GLIBCXX_USE_CXX11_ABI=0"
+@@ -151,7 +152,7 @@ def buildSim(cppFlags, dir, type, pgo=None):
+     env["CPPPATH"] += ["."]
+ 
+     # HDF5
+-    env["PINLIBS"] += ["hdf5", "hdf5_hl"]
++    env["PINLIBS"] += ["hdf5", "hdf5_hl", "z"]
+ 
+     # Harness needs these defined
+     env["CPPFLAGS"] += ' -DPIN_PATH="' + joinpath(PINPATH, "intel64/bin/pinbin") + '" '
+diff --git a/src/SConscript b/src/SConscript
+index 96744f2..39a4ee7 100644
+--- a/src/SConscript
++++ b/src/SConscript
+@@ -41,7 +41,7 @@ traceEnv.Program("dumptrace", ["dumptrace.cpp", "access_tracing.cpp", "memory_hi
+ traceEnv.Program("sorttrace", ["sorttrace.cpp", "access_tracing.cpp"] + commonSrcs)
+ 
+ # Build harness (static to make it easier to run across environments)
+-env["LINKFLAGS"] += " --static "
++# env["LINKFLAGS"] += " --static "
+ env["LIBS"] += ["pthread"]
+ env.Program("zsim", harnessSrcs + commonSrcs)
+ 
+diff --git a/src/init.cpp b/src/init.cpp
+index babbd12..75fc50a 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -54,6 +54,7 @@
+ #include "null_core.h"
+ #include "ooo_core.h"
+ #include "part_repl_policies.h"
++#include "rrip_repl.h"
+ #include "pin_cmd.h"
+ #include "prefetcher.h"
+ #include "proc_stats.h"
+@@ -164,6 +165,13 @@ BaseCache* BuildCacheBank(Config& config, const string& prefix, g_string& name,
+         rp = new NRUReplPolicy(numLines, candidates);
+     } else if (replType == "Rand") {
+         rp = new RandReplPolicy(candidates);
++    } else if (replType == "SRRIP") {
++        // max value of RRPV, you need to pass it to your SRRIP constructor
++        uint32_t rpvMax = 3;
++        assert(isPow2(rpvMax + 1));
++        // add your SRRIP construction code here
++        rp = new SRRIPReplPolicy(numLines, rpvMax);
++
+     } else if (replType == "WayPart" || replType == "Vantage" || replType == "IdealLRUPart") {
+         if (replType == "WayPart" && arrayType != "SetAssoc") panic("WayPart replacement requires SetAssoc array");
+ 
+@@ -625,6 +633,7 @@ static void InitSystem(Config& config) {
+             string prefix = string("sys.cores.") + group + ".";
+             uint32_t cores = config.get<uint32_t>(prefix + "cores", 1);
+             string type = config.get<const char*>(prefix + "type", "Simple");
++            string automaton = config.get<const char*>(prefix + "automaton", "A2");
+ 
+             //Build the core group
+             union {
+@@ -695,6 +704,7 @@ static void InitSystem(Config& config) {
+                         zinfo->eventRecorders[coreIdx] = ocore->getEventRecorder();
+                         zinfo->eventRecorders[coreIdx]->setSourceId(coreIdx);
+                         core = ocore;
++                        if (automaton == "A3") ocore->useA3forBranchPred();
+                     }
+                     coreMap[group].push_back(core);
+                     coreIdx++;
+@@ -865,6 +875,8 @@ void SimInit(const char* configFile, const char* outputDir, uint32_t shmid) {
+ 
+     Config config(configFile);
+ 
++    zinfo->outputDir = gm_strdup(config.get<const char*>("pin.outputDir", outputDir));
++
+     //Debugging
+     //NOTE: This should be as early as possible, so that we can attach to the debugger before initialization.
+     zinfo->attachDebugger = config.get<bool>("sim.attachDebugger", false);
+diff --git a/src/ooo_core.cpp b/src/ooo_core.cpp
+index 66a501c..0e208a3 100644
+--- a/src/ooo_core.cpp
++++ b/src/ooo_core.cpp
+@@ -71,7 +71,7 @@ OOOCore::OOOCore(FilterCache* _l1i, FilterCache* _l1d, g_string& _name) : Core(_
+     curCycleIssuedUops = 0;
+     branchPc = 0;
+ 
+-    instrs = uops = bbls = approxInstrs = mispredBranches = 0;
++    instrs = uops = bbls = approxInstrs = mispredBranches = condBranches = 0;
+ 
+     for (uint32_t i = 0; i < FWD_ENTRIES; i++) fwdArray[i].set((Address)(-1L), 0);
+ }
+@@ -98,6 +98,8 @@ void OOOCore::initStats(AggregateStat* parentStat) {
+     approxInstrsStat->init("approxInstrs", "Instrs with approx uop decoding", &approxInstrs);
+     ProxyStat* mispredBranchesStat = new ProxyStat();
+     mispredBranchesStat->init("mispredBranches", "Mispredicted branches", &mispredBranches);
++    ProxyStat* condBranchesStat = new ProxyStat();
++    condBranchesStat->init("condBranches", "conditional branches", &condBranches);
+ 
+     coreStat->append(cyclesStat);
+     coreStat->append(cCyclesStat);
+@@ -106,6 +108,7 @@ void OOOCore::initStats(AggregateStat* parentStat) {
+     coreStat->append(bblsStat);
+     coreStat->append(approxInstrsStat);
+     coreStat->append(mispredBranchesStat);
++    coreStat->append(condBranchesStat);
+ 
+ #ifdef OOO_STALL_STATS
+     profFetchStalls.init("fetchStalls",  "Fetch stalls");  coreStat->append(&profFetchStalls);
+@@ -377,6 +380,7 @@ inline void OOOCore::bbl(Address bblAddr, BblInfo* bblInfo) {
+     uint32_t lineSize = 1 << lineBits;
+ 
+     // Simulate branch prediction
++    if (branchPc) condBranches++;
+     if (branchPc && !branchPred.predict(branchPc, branchTaken)) {
+         mispredBranches++;
+ 
+diff --git a/src/ooo_core.h b/src/ooo_core.h
+index 9fa4a1d..24a5550 100644
+--- a/src/ooo_core.h
++++ b/src/ooo_core.h
+@@ -50,9 +50,11 @@ class BranchPredictorPAg {
+     private:
+         uint32_t bhsr[1 << NB];
+         uint8_t pht[1 << LB];
++        bool useA2; // Ture: use A2, else use A3
+ 
+     public:
+         BranchPredictorPAg() {
++            useA2 = true;
+             uint32_t numBhsrs = 1 << NB;
+             uint32_t phtSize = 1 << LB;
+ 
+@@ -91,12 +93,20 @@ class BranchPredictorPAg {
+             // info("BP Pred: 0x%lx bshr[%d]=%x taken=%d pht=%d pred=%d", branchPc, bhsrIdx, phtIdx, taken, pht[phtIdx], pred);
+ 
+             // Update
+-            pht[phtIdx] = taken? (pred? 3 : (pht[phtIdx]+1)) : (pred? (pht[phtIdx]-1) : 0); //2-bit saturating counter
++            if (useA2) {
++                pht[phtIdx] = taken? (pred? 3 : (pht[phtIdx]+1)) : (pred? (pht[phtIdx]-1) : 0); //2-bit saturating counter
++            } else {
++                // Please implement Automaton 3 for update
++
++            }
+             bhsr[bhsrIdx] = ((bhsr[bhsrIdx] << 1) & histMask ) | (taken? 1: 0); //we apply phtMask here, dependence is further away
+ 
+             // info("BP Update: newPht=%d newBshr=%x", pht[phtIdx], bhsr[bhsrIdx]);
+             return (taken == pred);
+         }
++
++        // Set to use Automaton 3
++        inline void useA3() {useA2 = false;}
+ };
+ 
+ 
+@@ -413,7 +423,7 @@ class OOOCore : public Core {
+         uint64_t decodeCycle;
+         CycleQueue<28> uopQueue;  // models issue queue
+ 
+-        uint64_t instrs, uops, bbls, approxInstrs, mispredBranches;
++        uint64_t instrs, uops, bbls, approxInstrs, mispredBranches, condBranches;
+ 
+ #ifdef OOO_STALL_STATS
+         Counter profFetchStalls, profDecodeStalls, profIssueStalls;
+@@ -454,6 +464,9 @@ class OOOCore : public Core {
+         void cSimStart();
+         void cSimEnd();
+ 
++        // Set Automaton 3 for branch predictor update
++        inline void useA3forBranchPred() {branchPred.useA3();}
++
+     private:
+         inline void load(Address addr);
+         inline void store(Address addr);
+diff --git a/src/rrip_repl.h b/src/rrip_repl.h
+new file mode 100644
+index 0000000..fd3c490
+--- /dev/null
++++ b/src/rrip_repl.h
+@@ -0,0 +1,59 @@
++#ifndef RRIP_REPL_H_
++#define RRIP_REPL_H_
++
++#include "repl_policies.h"
++
++// Static RRIP
++class SRRIPReplPolicy : public ReplPolicy {
++    protected:
++        // add class member variables here
++        uint32_t* rrpv; // the array of RRPV values
++        uint32_t numLines;
++        uint32_t rpvMax; //is 3, hardcoded into init.cpp
++        bool* justInserted; //determines in replaced if line just inserted
++
++    public:
++        // add member methods here, refer to repl_policies.h
++            SRRIPReplPolicy(uint32_t _numLines, uint32_t _rpvMax): numLines(_numLines), rpvMax(_rpvMax) {
++                rrpv = gm_calloc<uint32_t>(numLines);
++                for (uint32_t i = 0; i < numLines; i++) {                                                                                                                                                                                          
++                    rrpv[i] = rpvMax;                                                                                                                                                                                                              
++                }   
++                justInserted = gm_calloc<bool>(numLines); //alr initialized to 0
++            }
++            ~SRRIPReplPolicy(){
++                gm_free(rrpv);
++                gm_free(justInserted);
++            }
++            virtual void replaced(uint32_t id){
++                justInserted[id] = true; //slot evicted, next update call is post-insert
++            }
++            virtual void update(uint32_t id, const MemReq* req){
++                if(justInserted[id]){
++                    rrpv[id] = rpvMax - 1;
++                    justInserted[id] = false;
++                }
++                else{
++                    rrpv[id] = 0; //hit priority
++                }
++            }
++            template <typename C> inline uint32_t rank(const MemReq* req, C cands){
++                while(true){
++                    //scan for rpvMax, return if found
++                    for (auto ci = cands.begin(); ci != cands.end(); ci.inc()) {
++                        if(rrpv[*ci] == rpvMax){
++                            return *ci;
++                        }
++                    }
++                    //if none found, increment rrpv
++                    for (auto id = cands.begin(); id != cands.end(); id.inc()) {                                                                                                                                                                                          
++                        rrpv[*id] += 1;                                                                                                                                                                                                              
++                    }
++                }
++            }
++            
++    
++        // DECL_RANK_BINDINGS;
++         DECL_RANK_BINDINGS; 
++};      
++#endif // RRIP_REPL_H_
+diff --git a/src/zsim_harness.cpp b/src/zsim_harness.cpp
+index c0f2902..c12e9ca 100644
+--- a/src/zsim_harness.cpp
++++ b/src/zsim_harness.cpp
+@@ -214,7 +214,11 @@ static void printHeartbeat(GlobSimInfo* zinfo) {
+     char hostname[256];
+     gethostname(hostname, 256);
+ 
+-    std::ofstream hb("heartbeat");
++    g_string pathStr= zinfo->outputDir;
++    pathStr += "/";
++    const char* hbFile = gm_strdup((pathStr + "heartbeat").c_str());
++    std::ofstream hb(hbFile);
++//    std::ofstream hb("heartbeat");
+     hb << "Running on: " << hostname << std::endl;
+     hb << "Start time: " << ctime_r(&startTime, time);
+     hb << "Heartbeat time: " << ctime_r(&curTime, time);
+@@ -388,6 +392,7 @@ int main(int argc, char *argv[]) {
+     if (aslr) info("Not disabling ASLR, multiprocess runs will fail");
+ 
+     //Create children processes
++    outputDir = conf.get<const char*>("pin.outputDir", outputDir);
+     pinCmd = new PinCmd(&conf, configFile, outputDir, shmid);
+     uint32_t numProcs = pinCmd->getNumCmdProcs();
+ 

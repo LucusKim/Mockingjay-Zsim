@@ -1,0 +1,467 @@
+#ifndef MOCKINGJAY_REPL_H_
+#define MOCKINGJAY_REPL_H_
+
+#include "repl_policies.h"
+#include <unordered_map>
+#include "zsim.h"
+#include "hash.h"
+#include <algorithm>
+#include <cstdlib>
+
+// Mockingjay Replacement Policy Implementation
+class MockingjayReplPolicy : public ReplPolicy {
+    protected:
+        // ---- constants ----
+        static const int HISTORY = 8;
+        static const int GRANULARITY = 8;
+        static const int SAMPLED_CACHE_WAYS = 5;
+        static const int LOG2_SAMPLED_CACHE_SETS = 4;
+        static const int TIMESTAMP_BITS = 8;
+        static constexpr double TEMP_DIFFERENCE = 1.0/16.0;
+
+        // ---- runtime constants (computed in constructor) ----
+        int INF_RD;
+        int INF_ETR;
+        int MAX_RD;
+        int LOG2_LLC_SET;
+        int LOG2_LLC_SIZE;
+        int LOG2_SAMPLED_SETS;
+        int SAMPLED_CACHE_TAG_BITS;
+        int PC_SIGNATURE_BITS;
+
+        // ---- cache dimensions ----
+        uint32_t numLines;
+        uint32_t numWays;
+        uint32_t numSets;
+        uint32_t numCPUS;
+        HashFamily* hf;
+
+        // ---- data structures ----
+        int** etr;                  // etr[set][way], each line predicted time to reuse
+        int* etr_clock;             // one per set, counts accesses since last ETR decrement
+        int* current_timestamp;     // one per set, 8-bit counter to measure reuse distance
+
+        bool* justInserted; //determines in replaced if line just inserted, zsim need to show if hit
+
+        // ---- debug counters (rate-limited logging) ----
+        uint64_t dbg_update_calls;    // total update() calls
+        uint64_t dbg_bypass_calls;    // total shouldBypass() calls
+        uint64_t dbg_bypass_fires;    // bypass returned true
+        uint64_t dbg_etr_inf_unknown; // lines assigned INF_ETR due to unknown PC
+        uint64_t dbg_etr_inf_dead;    // lines assigned INF_ETR due to rdp > MAX_RD
+        uint64_t dbg_sampler_hits;    // sampled cache hits (reuse observed)
+        uint64_t dbg_sampler_misses;  // sampled cache misses (first/no reuse)
+
+        struct SampledCacheLine {
+            bool valid;
+            uint64_t tag;
+            uint64_t signature;
+            int timestamp;
+        };
+
+        unordered_map<uint32_t, int> rdp; //PC signature to predicted reuse distance
+        unordered_map<uint32_t, SampledCacheLine*> sampled_cache; //maps samples cache index
+
+
+
+        
+
+    public:
+        MockingjayReplPolicy(uint32_t _numLines, uint32_t _numWays, uint32_t _numCPUS, HashFamily* _hf = nullptr){
+            // initialize cache dimensions, based on values passed through constructor
+            numLines = _numLines;
+            numWays = _numWays;
+            numSets = numLines / numWays;
+
+            // compute runtime constants
+            //__builtin_ctz is better than log2 because it is integer arithmetic
+            LOG2_LLC_SET = __builtin_ctz(numSets);
+            // lineBits is a process-local global set by Pin-instrumented children (zsim.cpp:1505).
+            // The constructor runs in the server process before any child starts, so lineBits=0 here.
+            // Use __builtin_ctz(zinfo->lineSize) instead — zinfo is fully initialized before caches are built.
+            int localLineBits = __builtin_ctz(zinfo->lineSize);
+            LOG2_LLC_SIZE = LOG2_LLC_SET + __builtin_ctz(numWays) + localLineBits;
+            LOG2_SAMPLED_SETS = LOG2_LLC_SIZE - 16;
+            INF_RD = numWays * HISTORY - 1;
+            INF_ETR = (numWays * HISTORY / GRANULARITY) - 1;
+            MAX_RD = INF_RD - 22;
+            SAMPLED_CACHE_TAG_BITS = 31 - LOG2_LLC_SIZE;
+            PC_SIGNATURE_BITS = LOG2_LLC_SIZE - 10;
+            numCPUS = _numCPUS; //for 8 cores
+            hf = _hf;
+
+            // initialize debug counters
+            dbg_update_calls = 0;
+            dbg_bypass_calls = 0;
+            dbg_bypass_fires = 0;
+            dbg_etr_inf_unknown = 0;
+            dbg_etr_inf_dead = 0;
+            dbg_sampler_hits = 0;
+            dbg_sampler_misses = 0;
+
+            info("[MJ-INIT] numLines=%u ways=%u sets=%u numCPUS_at_ctor=%u hf=%s "
+                 "INF_ETR=%d INF_RD=%d MAX_RD=%d LOG2_LLC_SET=%d LOG2_LLC_SIZE=%d localLineBits=%d SAMPLED_SETS=%d",
+                 numLines, numWays, numSets, _numCPUS, _hf ? "set" : "null",
+                 INF_ETR, INF_RD, MAX_RD, LOG2_LLC_SET, LOG2_LLC_SIZE, localLineBits, 1 << LOG2_SAMPLED_SETS);
+
+            // initialize data sctructures
+            // create a 2d array of ETR counters, one entry per cache line
+            etr = new int*[numSets];
+            for (uint32_t i = 0; i < numSets; i++) {
+                etr[i] = new int[numWays](); // (numSets) x (numWays)
+            }
+
+            // create one aging clock and one timestamp counter per set
+            etr_clock = new int[numSets];
+            current_timestamp = new int[numSets];
+
+            // set each clock to GRANULARITY so aging triggers immediately on first access
+            // set each timestamp to 0 since no accesses have happened yet
+            for (uint32_t i = 0; i < numSets; i++) {
+                etr_clock[i] = GRANULARITY;
+                current_timestamp[i] = 0;
+            }
+
+            justInserted = gm_calloc<bool>(numLines);
+
+            // initialize sampled cache
+            // only begin tracking sets that are determined to be designated sampling sets
+            for (uint32_t set = 0; set < numSets; set++) {
+                if (is_sampled_set(set)) {
+                    int modifier = 1 << LOG2_LLC_SET;
+                    int limit = 1 << LOG2_SAMPLED_CACHE_SETS;
+                    for (int i = 0; i < limit; i++) {
+                        sampled_cache[set + modifier*i] = new SampledCacheLine[SAMPLED_CACHE_WAYS]();
+                    }
+                }
+            }
+        }
+
+        ~MockingjayReplPolicy(){
+            gm_free(justInserted);
+            for (uint32_t i = 0; i < numSets; i++) delete[] etr[i];
+            delete[] etr;
+            delete[] etr_clock;
+            delete[] current_timestamp;
+            for (auto& kv : sampled_cache) delete[] kv.second;
+        }
+
+
+        // tells what LLC sets are sampled
+        bool is_sampled_set(int set) {
+            int mask_length = LOG2_LLC_SET-LOG2_SAMPLED_SETS;
+            int mask = (1 << mask_length) - 1;
+            return (set & mask) == ((set >> (LOG2_LLC_SET - mask_length)) & mask);
+        }
+
+        // Scrambles the PC of instructions to ensure that each instruction gets mapped to a unique slot in the predictor table (avoids overwriting)
+        uint64_t CRC_HASH( uint64_t _blockAddress )
+        {
+            static const unsigned long long crcPolynomial = 3988292384ULL;
+            unsigned long long _returnVal = _blockAddress;
+            for( unsigned int i = 0; i < 3; i++)
+                _returnVal = ( ( _returnVal & 1 ) == 1 ) ? ( ( _returnVal >> 1 ) ^ crcPolynomial ) : ( _returnVal >> 1 );
+            return _returnVal;
+        }
+
+        // Combines the instruction address (PC) with extra information (like hits, prefetches, or core ID)
+        uint32_t get_pc_signature(uint64_t pc, bool hit, uint32_t core) {
+            if (numCPUS == 1) {
+                pc = pc << 1;
+                if(hit) {
+                    pc = pc | 1;
+                }
+                pc = CRC_HASH(pc);
+                pc = (pc << (64 - PC_SIGNATURE_BITS)) >> (64 - PC_SIGNATURE_BITS);
+            } else {
+                pc = pc << 2;
+                pc = pc | core;
+                pc = CRC_HASH(pc);
+                pc = (pc << (64 - PC_SIGNATURE_BITS)) >> (64 - PC_SIGNATURE_BITS);
+            }
+            return pc;
+        }
+
+        // parses the memory address to get index and tag
+        uint32_t get_sampled_cache_index(uint64_t full_addr) {
+            full_addr = full_addr >> lineBits;
+            full_addr = (full_addr << (64 - (LOG2_SAMPLED_CACHE_SETS + LOG2_LLC_SET))) >> (64 - (LOG2_SAMPLED_CACHE_SETS + LOG2_LLC_SET));
+            return full_addr;
+        }
+
+        uint64_t get_sampled_cache_tag(uint64_t x) {
+            x >>= LOG2_LLC_SET + lineBits + LOG2_SAMPLED_CACHE_SETS;
+            x = (x << (64 - SAMPLED_CACHE_TAG_BITS)) >> (64 - SAMPLED_CACHE_TAG_BITS);
+            return x;
+        }
+
+        // Searches a specific set of the sampled cache to find a specific address
+        int search_sampled_cache(uint64_t blockAddress, uint32_t set) {
+            SampledCacheLine* sampled_set = sampled_cache[set];
+            for (uint32_t way = 0; way < SAMPLED_CACHE_WAYS; way++) {
+                if (sampled_set[way].valid && (sampled_set[way].tag == blockAddress)) {
+                    return way;
+                }
+            }
+            return -1;
+        }
+
+        // Handles a sampled cache eviction
+        void detrain(uint32_t set, int way) {
+            SampledCacheLine temp = sampled_cache[set][way];
+            if (!temp.valid) {
+                return;
+            }
+
+            if (rdp.count((uint32_t)temp.signature)) {
+                rdp[(uint32_t)temp.signature] = min(rdp[(uint32_t)temp.signature] + 1, INF_RD);
+            } else {
+                rdp[(uint32_t)temp.signature] = INF_RD;
+            }
+            sampled_cache[set][way].valid = false;
+        }
+
+        // Slowly update the Reuse Distance in the predictor's memory to avoid an overreaction
+        int temporal_difference(int init, int sample) {
+            if (sample > init) {
+                int diff = sample - init;
+                diff = diff * TEMP_DIFFERENCE;
+                diff = min(1, diff);
+                return min(init + diff, INF_RD);
+            } else if (sample < init) {
+                int diff = init - sample;
+                diff = diff * TEMP_DIFFERENCE;
+                diff = min(1, diff);
+                return max(init - diff, 0);
+            } else {
+                return init;
+            }
+        }
+
+        // Increases the timestamp counter by 1
+        int increment_timestamp(int input) {
+            input++;
+            input = input % (1 << TIMESTAMP_BITS);
+            return input;
+        }
+
+        // Calculates the Reuse Distance (difference in timestamps)
+        int time_elapsed(int global, int local) {
+            if (global >= local) {
+                return global - local;
+            }
+            global = global + (1 << TIMESTAMP_BITS);
+            return global - local;
+        }
+
+
+        virtual void replaced(uint32_t id){
+            justInserted[id] = true; //slot evicted, next update call is post-insert
+        }
+
+
+        //update function
+        virtual void update(uint32_t id, const MemReq* req){
+            // zinfo->numCores is 0 at construction time (set at init.cpp:914, after caches built).
+            // Lazy-init here so we get the real core count on first simulation call.
+            if (numCPUS == 0) {
+                numCPUS = zinfo->numCores;
+                info("[MJ-INIT] Lazy numCPUS init: numCPUS set to %u on first update() call", numCPUS);
+            }
+            dbg_update_calls++;
+            // Log periodic update() summary (every 10M calls)
+            if (dbg_update_calls % 10000000 == 0) {
+                info("[MJ-UPDATE] calls=%lu bypass_calls=%lu bypass_fires=%lu "
+                     "etr_inf_unknown=%lu etr_inf_dead=%lu sampler_hits=%lu sampler_misses=%lu",
+                     dbg_update_calls, dbg_bypass_calls, dbg_bypass_fires,
+                     dbg_etr_inf_unknown, dbg_etr_inf_dead, dbg_sampler_hits, dbg_sampler_misses);
+            }
+            bool hit = !justInserted[id];                                                                                                                                                                                  
+            justInserted[id] = false; 
+            //id = set* numways + way
+            uint32_t set = id / numWays;
+            uint32_t way = id % numWays;
+
+            //MemReq has lineAddr, type, srcID, cycle, state
+            uint64_t full_addr = (req->lineAddr) << lineBits; //get full_addr
+            if (req->type == PUTS || req->type == PUTX) { //equivalent to WRITEBACK
+                    if(!hit){
+                        etr[set][way] = -INF_ETR;
+                    }
+                    return;
+            }
+            //PC signature = PC, whether it is a hit, and core making request
+            uint32_t pc = get_pc_signature(req->pc, hit, req->srcId);
+
+            // raw_set uses the raw address bits (not H3-hashed), consistent with how
+            // sampled_cache_index is computed; use this for all sampled-cache logic.
+            uint32_t raw_set = (req->lineAddr) & (numSets - 1);
+
+            //Check to see if address that was just accessed is in sampler
+            if(is_sampled_set(raw_set)){ //check if sampled set
+                uint32_t sampled_cache_index = get_sampled_cache_index(full_addr); //index of sampled cache
+                uint64_t sampled_cache_tag = get_sampled_cache_tag(full_addr); //tag of sampled cache block
+                int sampled_cache_way = search_sampled_cache(sampled_cache_tag, sampled_cache_index); //way in cache, hit returns a number if found, miss returns -1
+
+                if (sampled_cache_way > -1) { //on a hit
+                    dbg_sampler_hits++;
+                    //find time diff between last access and now
+                    uint32_t last_signature = sampled_cache[sampled_cache_index][sampled_cache_way].signature;
+                    int last_timestamp = sampled_cache[sampled_cache_index][sampled_cache_way].timestamp;
+                    int sample = time_elapsed(current_timestamp[raw_set], last_timestamp); //reuse distance
+                    
+                    //if too much time passed, discard
+                    if (sample <= INF_RD) { 
+                        if (rdp.count(last_signature)) {
+                            //update rdp on pc with this block
+                            int init = rdp[last_signature];
+                            rdp[last_signature] = temporal_difference(init, sample);
+                        } else { //if first time seeing the pc, set prediction to reuse distance
+                            rdp[last_signature] = sample;
+                        }
+                        //invalidate sampled cache entry, as block has been reused
+                        sampled_cache[sampled_cache_index][sampled_cache_way].valid = false;
+                    }
+                }
+
+
+            if (sampled_cache_way == -1) dbg_sampler_misses++; // sampled-cache miss
+            //Where cache will make room to track new access in sampled set
+            int lru_way = -1; //index of best eviction candidate
+            int lru_rd = -1; //tracks reuse distance
+
+            //scan all ways to find if theres an invalid slot
+            for (uint32_t w = 0; w < SAMPLED_CACHE_WAYS; w++) {
+                if (sampled_cache[sampled_cache_index][w].valid == false) {
+                    lru_way = w;
+                    lru_rd = INF_RD + 1; //empty slot always beats a live entry
+                    continue;
+                }
+                //compute how long ago was inserted
+                int last_timestamp = sampled_cache[sampled_cache_index][w].timestamp;
+                int sample = time_elapsed(current_timestamp[raw_set], last_timestamp);
+                if (sample > INF_RD) { //if longer than INF, evict it
+                    lru_way = w;
+                    lru_rd = INF_RD + 1;
+                    detrain(sampled_cache_index, (int) w); //penalize pc of evicted pc
+                } else if (sample > lru_rd) {
+                    lru_way = w;
+                    lru_rd = sample;
+                }
+            }
+            //penalize pc of block we are going to evict
+            detrain(sampled_cache_index, lru_way);
+
+            //find first invalid slot and insert the current access
+            for (uint32_t w = 0; w < SAMPLED_CACHE_WAYS; w++) {
+                if (sampled_cache[sampled_cache_index][w].valid == false) {
+                    sampled_cache[sampled_cache_index][w].valid = true;
+                    sampled_cache[sampled_cache_index][w].signature = pc;
+                    sampled_cache[sampled_cache_index][w].tag = sampled_cache_tag;
+                    sampled_cache[sampled_cache_index][w].timestamp = current_timestamp[raw_set];
+                    break;
+                }
+            }
+            //increment timestamp where set access event is unit of reuse distance
+            current_timestamp[raw_set] = increment_timestamp(current_timestamp[raw_set]);
+        }
+
+            //Where function will update ETR counters
+            if(etr_clock[set] == GRANULARITY) {
+                for (uint32_t w = 0; w < numWays; w++) {
+                    if (w != way && abs(etr[set][w]) < INF_ETR) {
+                        etr[set][w]--;
+                    }
+                }
+                etr_clock[set] = 0;
+            }
+            etr_clock[set]++;
+            
+            
+            if (way < numWays) {
+                if(!rdp.count(pc)) {
+                    if (numCPUS == 1) {
+                        etr[set][way] = 0;
+                    } else {
+                        etr[set][way] = INF_ETR;
+                        dbg_etr_inf_unknown++;
+                    }
+                } else {
+                    if(rdp[pc] > MAX_RD) {
+                        etr[set][way] = INF_ETR;
+                        dbg_etr_inf_dead++;
+                    } else {
+                        etr[set][way] = rdp[pc] / GRANULARITY;
+                    }
+                }
+            }
+
+        }
+
+        //rank function
+        template <typename C> inline uint32_t rank(const MemReq* req, C cands){
+            
+            //ZSIM already checks if theres an invalid block to evict
+            //so all cands are valid
+            
+            //scan for all candidates
+            int max_etr = -1;
+            int victim_way = 0;
+            int victim_set = 0;
+            for (auto ci = cands.begin(); ci!= cands.end(); ci.inc()){
+                //line id can calculate set and way
+                uint32_t lineID = *ci; 
+                uint32_t set = lineID / numWays;
+                uint32_t way = lineID % numWays;
+
+                //highest etr should be evicted. 
+                if((abs(etr[set][way]) > max_etr) || (abs(etr[set][way]) == max_etr && etr[set][way] < 0)){
+                    max_etr = abs(etr[set][way]);
+                    victim_way = way;
+                    victim_set = set;
+                }
+            }
+            return victim_set * numWays + victim_way;
+
+            //we dont need to check for bypass, because that will be a separate function
+        }
+    
+        //bypass function: called before preinsert, decides whether line should skip cache
+        bool shouldBypass(const MemReq* req){
+            dbg_bypass_calls++;
+            // Log first call to confirm what zinfo->numCores returns at simulation time
+            if (dbg_bypass_calls == 1) {
+                info("[MJ-BYPASS] First shouldBypass call: numCPUS=%u zinfo->numCores=%u type=%d",
+                     numCPUS, (uint32_t)zinfo->numCores, (int)req->type);
+            }
+
+            if (!IsPut(req->type)){
+                uint32_t pc_signature = get_pc_signature(req->pc, false, req->srcId);
+                if (rdp.count(pc_signature)){
+                    uint32_t set = hf ? hf->hash(0, req->lineAddr) & (numSets - 1)
+                                      : (req->lineAddr >> 0) & (numSets - 1);
+                    int max_etr = -1;
+                    for(uint32_t w = 0; w < numWays; ++w){
+                        if(abs(etr[set][w]) > max_etr){
+                            max_etr = abs(etr[set][w]);
+                        }
+                    }
+                    if(rdp[pc_signature] > MAX_RD || rdp[pc_signature] / GRANULARITY > max_etr) {
+                        dbg_bypass_fires++;
+                        // Log first bypass fire with context
+                        if (dbg_bypass_fires == 1) {
+                            info("[MJ-BYPASS] FIRST FIRE: numCores=%u pc_sig=0x%x rdp=%d MAX_RD=%d max_etr=%d",
+                                 (uint32_t)zinfo->numCores, pc_signature,
+                                 rdp[pc_signature], MAX_RD, max_etr);
+                        }
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // DECL_RANK_BINDINGS;
+         DECL_RANK_BINDINGS; 
+};      
+#endif // RRIP_REPL_H_
